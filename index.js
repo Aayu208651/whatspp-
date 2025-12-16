@@ -2,7 +2,6 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const formidable = require('formidable');
-const qrcode = require('qrcode');
 const moment = require('moment-timezone');
 const { Boom } = require('@hapi/boom');
 const {
@@ -22,7 +21,6 @@ app.use(express.json());
 app.use(express.static('public'));
 
 let globalSocket = null;
-let qrData = null;
 let isReady = false;
 let isLooping = false;
 let currentLoop = null;
@@ -35,6 +33,8 @@ let lastMessages = {
 
 let sendMessages = async () => {};
 
+/* ================= SOCKET ================= */
+
 async function startSocket() {
   if (globalSocket) return;
 
@@ -44,51 +44,29 @@ async function startSocket() {
   const sock = makeWASocket({
     version,
     auth: state,
-    printQRInTerminal: false,
-    browser: ['Aadi Server', 'Chrome', '1.0'],
-    getMessage: async () => ({ conversation: "hello" })
+    browser: ['PairCode Server', 'Chrome', '1.0'],
+    printQRInTerminal: false
   });
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', async (update) => {
-    const { qr, connection, lastDisconnect } = update;
-
-    if (qr) {
-      qrData = qr;
-      isReady = false;
-    }
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update;
 
     if (connection === 'open') {
       isReady = true;
-      qrData = null;
-      console.log('✅ WhatsApp Connected!');
-      if (isLooping && currentLoop === null) {
-        console.log('🔁 Reconnected — restarting message loop...');
-        currentLoop = sendMessages();
-      }
+      console.log('✅ WhatsApp Connected');
     }
 
     if (connection === 'close') {
       isReady = false;
-      qrData = null;
       globalSocket = null;
 
-      const reasonCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      console.log('⚠️ Disconnected. Code:', reasonCode);
+      const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      console.log('❌ Disconnected:', code);
 
-      if (reasonCode !== DisconnectReason.loggedOut) {
-        console.log('🔁 Attempting reconnect...');
+      if (code !== DisconnectReason.loggedOut) {
         setTimeout(startSocket, 3000);
-      } else {
-        console.log('🔒 Logged out. Resetting session...');
-        try {
-          fs.rmSync(sessionFolder, { recursive: true, force: true });
-          fs.mkdirSync(sessionFolder);
-        } catch (err) {
-          console.error('❌ Session reset failed:', err);
-        }
-        setTimeout(startSocket, 2000);
       }
     }
   });
@@ -98,21 +76,35 @@ async function startSocket() {
 
 startSocket();
 
-// ✅ Get QR API
-app.get('/api/qr', async (req, res) => {
-  if (isReady) return res.json({ message: '✅ Already authenticated!' });
-  if (!qrData) return res.json({ message: '⏳ QR not ready yet.' });
-  const qrImage = await qrcode.toDataURL(qrData);
-  res.json({ qr: qrImage });
+/* ================= PAIR CODE API ================= */
+
+// 🔑 UI / POST se pair code milega
+app.post('/api/pair', async (req, res) => {
+  try {
+    const number = (req.body.number || '').replace(/\D/g, '');
+
+    if (!number)
+      return res.status(400).json({ error: 'Phone number required' });
+
+    if (!globalSocket)
+      return res.status(400).json({ error: 'Socket not ready' });
+
+    const code = await globalSocket.requestPairingCode(number);
+
+    res.json({ pairCode: code });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// ✅ Start Message Loop
+/* ================= MESSAGE APIs ================= */
+
+// Start Loop
 app.post('/api/start', (req, res) => {
-  if (isLooping) {
-    return res.status(400).json({ error: '⚠️ Already running. Stop first.' });
-  }
+  if (isLooping) return res.status(400).json({ error: 'Already running' });
 
   const form = new formidable.IncomingForm();
+
   form.parse(req, async (err, fields, files) => {
     if (err) return res.status(500).json({ error: 'Form error' });
 
@@ -120,8 +112,8 @@ app.post('/api/start', (req, res) => {
     const delaySec = parseInt(fields.delay) || 2;
     const rawReceivers = (fields.receiver || '').toString().trim();
 
-    if (!rawReceivers) return res.status(400).json({ error: '❌ Receivers required' });
-    if (!files.file) return res.status(400).json({ error: '❌ Message file required' });
+    if (!rawReceivers) return res.status(400).json({ error: 'Receivers required' });
+    if (!files.file) return res.status(400).json({ error: 'File required' });
 
     const receivers = rawReceivers
       .split(',')
@@ -130,83 +122,65 @@ app.post('/api/start', (req, res) => {
       .map(r => r.endsWith('@g.us') ? r : r + '@s.whatsapp.net');
 
     const file = Array.isArray(files.file) ? files.file[0] : files.file;
-    const filePath = file.filepath || file.path;
-    const lines = fs.readFileSync(filePath, 'utf-8')
+    const lines = fs.readFileSync(file.filepath, 'utf-8')
       .split('\n')
-      .map(line => `${name} ${line.replace(/{name}/gi, '')}`.trim())
+      .map(l => `${name} ${l.replace(/{name}/gi, '')}`.trim())
       .filter(Boolean);
 
-    if (receivers.length === 0 || lines.length === 0) {
-      return res.status(400).json({ error: '❌ No valid receivers or messages.' });
-    }
+    if (!globalSocket || !isReady)
+      return res.status(400).json({ error: 'WhatsApp not connected' });
 
-    const sock = globalSocket;
-    if (!sock || !isReady) return res.status(400).json({ error: '❌ WhatsApp not connected' });
-
-    messageLogs = [];
     isLooping = true;
     lastMessages = { receivers, lines, delaySec };
+    messageLogs = [];
 
     sendMessages = async () => {
-      try {
-        while (isLooping) {
-          for (const line of lastMessages.lines) {
-            for (const jid of lastMessages.receivers) {
-              if (!isLooping) break;
-              try {
-                await globalSocket.sendMessage(jid, { text: line });
-                const time = moment().tz("Asia/Kolkata").format("hh:mm:ss A");
-                messageLogs.push(`[${time}] ✅ Sent to ${jid}: ${line}`);
-              } catch (err) {
-                const time = moment().tz("Asia/Kolkata").format("hh:mm:ss A");
-                messageLogs.push(`[${time}] ❌ Failed to ${jid}: ${line}`);
-              }
-              await new Promise(resolve => setTimeout(resolve, lastMessages.delaySec * 1000));
+      while (isLooping) {
+        for (const line of lines) {
+          for (const jid of receivers) {
+            if (!isLooping) break;
+            try {
+              await globalSocket.sendMessage(jid, { text: line });
+              messageLogs.push(
+                `[${moment().format('HH:mm:ss')}] ✅ ${jid}`
+              );
+            } catch {
+              messageLogs.push(
+                `[${moment().format('HH:mm:ss')}] ❌ ${jid}`
+              );
             }
+            await new Promise(r => setTimeout(r, delaySec * 1000));
           }
         }
-      } catch (e) {
-        const time = moment().tz("Asia/Kolkata").format("hh:mm:ss A");
-        messageLogs.push(`[${time}] 💥 Loop crashed: ${e.message}`);
-        isLooping = false;
-        currentLoop = null;
       }
     };
 
     currentLoop = sendMessages();
-    res.json({ message: `✅ Started sending to ${receivers.length} receiver(s)` });
+    res.json({ message: 'Started' });
   });
 });
 
-// ✅ Stop Loop
-app.post('/api/stop', (req, res) => {
+// Stop
+app.post('/api/stop', (_, res) => {
   isLooping = false;
   currentLoop = null;
-  const time = moment().tz("Asia/Kolkata").format("hh:mm:ss A");
-  messageLogs.push(`[${time}] 🛑 Stopped by user`);
-  setTimeout(() => { messageLogs = []; }, 2000);
-  res.json({ message: '🛑 Stopped' });
+  res.json({ message: 'Stopped' });
 });
 
-// ✅ Logs
-app.get('/api/logs', (req, res) => {
+// Logs
+app.get('/api/logs', (_, res) => {
   res.json({ logs: messageLogs });
 });
 
-// ✅ Status
-app.get('/api/status', (req, res) => {
+// Status
+app.get('/api/status', (_, res) => {
   res.json({
     isConnected: isReady,
-    isLooping,
-    logCount: messageLogs.length
+    isLooping
   });
 });
 
-// ✅ Clear logs
-app.post('/api/clear-logs', (req, res) => {
-  messageLogs = [];
-  res.json({ message: '🧹 Logs cleared' });
-});
+/* ================= SERVER ================= */
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
