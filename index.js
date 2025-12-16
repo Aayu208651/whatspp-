@@ -12,7 +12,7 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const app = express();
-const PORT = process.env.PORT || 21625;
+const PORT = process.env.PORT || 3006;
 const sessionFolder = path.join(__dirname, 'session');
 
 if (!fs.existsSync(sessionFolder)) fs.mkdirSync(sessionFolder);
