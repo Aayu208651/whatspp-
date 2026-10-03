@@ -14,7 +14,7 @@
     "automation",
     "pair-code"
   ],
-  "author": "Aadi Pandey",
+  "author": "Ayush Tiwari",
   "license": "MIT",
   "engines": {
     "node": ">=16.0.0"
